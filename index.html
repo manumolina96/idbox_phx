@@ -4051,7 +4051,7 @@ map.addLayer({
     for (const s of visibles){
       escena.children.forEach(o => { if (o.isGroup) o.visible = o === s.grupo; });
       camara.projectionMatrix = matVista(s);
-      renderer.resetState(); renderer.render(escena, camara);
+      renderer.resetState(); renderer.clippingPlanes = corte && corte.s === s ? corte.planos : SIN_PLANOS; renderer.render(escena, camara);
     }
     D.sitios.forEach(s => s.grupo.visible = verModelos && s.creado && z >= D.zoom3d);
   }
@@ -4065,6 +4065,13 @@ map.on('zoom', nivelZoom); nivelZoom();
 
 /* ---------- color y visibilidad ---------- */
 let modoColor = 'real';
+/* estado de las herramientas BIM (se declara aquí porque aplicar() y pickDet() lo usan) */
+let modoEdif = 'trans', corte = null, umbral = null;
+const ocultosId = new Set(), aislados = new Set(), memoVivo = new Map(), SIN_PLANOS = [];
+function visibleId(id){ return !(ocultosId.has(id) || (aislados.size && !aislados.has(id))); }
+D.marcas = D.marcas || {};
+const MARCAS = [['ok', 'Correcto', '#2f9e6b'], ['vigilar', 'En vigilancia', '#e8b10c'], ['mal', 'Mal estado', '#d7191c'], ['fuera', 'Fuera de servicio', '#5b6670']];
+const colorMarca = m => m.color || (MARCAS.find(x => x[0] === m.estado) || [])[2] || '#8e6bd8';
 const nivelOculto = new Set();
 const colEstado = {'Nuevo':'#2f9e6b','Existente':'#7a8b99','Reutilizado':'#3b7dd8','Desmantelar':'#c94b44','Proyectado':'#e8730c'};
 const colFuente = {'PROYECTO':'#2f9e6b','SUPUESTO':'#d99a1e'};
@@ -4073,7 +4080,8 @@ nivelesTodos.forEach((n, i) => colNivel[n] = PAL[i % PAL.length]);
 const tiposLista = [...new Set(lista.map(a => a.tipo))]; const colTipo = {};
 tiposLista.forEach((t, i) => colTipo[t] = (D.tipos[t] && D.tipos[t].color) || PAL[i % PAL.length]);
 function colorDe(a){
-  if (modoColor === 'senal') return a && a.tipo !== 'Urbanización' && H ? H.color(a) : null;
+  if (modoColor === 'senal') return a && a.tipo !== 'Urbanización' ? colorSenal(a) : null;
+  if (modoColor === 'marcas'){ if (!a || a.tipo === 'Urbanización') return null; const mk = D.marcas[a.id]; return mk ? colorMarca(mk) : '#d5dade'; }
   if (!a || a.tipo === 'Urbanización') return null;
   if (modoColor === 'fuente') return colFuente[a.fuente] || '#9aa4ad';
   if (modoColor === 'estado') return colEstado[a.estado] || '#b8c0c8';
@@ -4082,7 +4090,8 @@ function colorDe(a){
   return null;
 }
 const CERO = new T.Matrix4().makeScale(0, 0, 0);
-function aplicar(){
+function aplicar(){ memoVivo.clear(); aplicar0(); }
+function aplicar0(){
   const blanco = new T.Color(1, 1, 1), c = new T.Color();
   for (const s of D.sitios) for (const m of s.mallas){
     const ud = m.userData;
@@ -4091,16 +4100,20 @@ function aplicar(){
       if (a && a.nivel && nivelOculto.has(a.nivel)) vis = false;
       if (i.k === 'IfcSpace') vis = false;
       if (a && a.tipo === 'Urbanización' && !verUrb) vis = false;
+      if (modoEdif === 'ocultos' && (i.k === 'IfcWall' || i.k === 'ROOF')) vis = false;
+      if (modoEdif === 'ocultos' && i.k === 'IfcSlab' && a && a.tipo === 'Edificio') vis = false;
+      if (i.a && !visibleId(i.a)) vis = false;
       m.setMatrixAt(k, vis ? ud.base[k] : CERO);
       const cc = colorDe(a); m.setColorAt(k, cc ? c.set(cc) : blanco);
     });
     m.material.color.copy(modoColor !== 'real' && ud.inst.some(i => colorDe(A[i.a])) ? blanco : ud.real);
+    if (ud.alfa < 0.99 && ud.inst.every(i => EDIF.has(i.k))){ const op = modoEdif === 'opacos'; m.material.opacity = op ? 1 : ud.alfa; m.material.transparent = !op; m.material.depthWrite = op; m.material.needsUpdate = true; }
     m.instanceMatrix.needsUpdate = true; if (m.instanceColor) m.instanceColor.needsUpdate = true;
   }
   leyenda(); resaltar();
 }
 function leyenda(){
-  const L = $('#leyenda'); if (modoColor === 'senal' && H){ H.leyenda(L); return; } let mapa = null;
+  const L = $('#leyenda'); if (modoColor === 'senal'){ leyendaSenal(L); return; } if (modoColor === 'marcas'){ leyendaMarcas(L); return; } let mapa = null;
   if (modoColor === 'fuente') mapa = colFuente; else if (modoColor === 'estado') mapa = colEstado;
   else if (modoColor === 'nivel') mapa = Object.fromEntries(nivelesTodos.map(n => [nivelNombre[n] || n, colNivel[n]]));
   else if (modoColor === 'tipo') mapa = Object.fromEntries(tiposLista.slice(0, 18).map(t => [t, colTipo[t]]));
@@ -4163,8 +4176,10 @@ function pickDet(px, py, soloSitio){
     ray.ray.set(o, f.sub(o).normalize());
     for (const hit of ray.intersectObjects(s.mallas, false)){
       const i = hit.object.userData.inst[hit.instanceId];
-      if (!i || !i.a || !A[i.a] || i.k === 'IfcSpace' || i.k === 'ROOF') continue;
-      if (hit.object.userData.alfa < 0.99 && EDIF.has(i.k)) continue;
+      if (!i || !i.a || !A[i.a] || i.k === 'IfcSpace' || (i.k === 'ROOF' && modoEdif !== 'opacos')) continue;
+      if (hit.object.userData.alfa < 0.99 && modoEdif !== 'opacos' && EDIF.has(i.k)) continue;
+      if (!visibleId(i.a) || (modoEdif === 'ocultos' && (i.k === 'IfcWall' || i.k === 'ROOF'))) continue;
+      if (corte && corte.s === s && corte.planos.some(pl => pl.distanceToPoint(hit.point) < 0)) continue;
       if (A[i.a].tipo === 'Urbanización' && !verUrb) continue;
       const v = new T.Vector4(hit.point.x, hit.point.y, hit.point.z, 1).applyMatrix4(P); const prof = v.z / v.w;
       if (!mejor || prof < mejor.prof) mejor = {id: i.a, prof, p: hit.point.clone(), sitio: s};
@@ -4173,7 +4188,7 @@ function pickDet(px, py, soloSitio){
   }
   return mejor;
 }
-map.on('click', e => { if (ajustando && pc.activo){ puntoControl(e); return; } if (ajustando) return; const id = pick(e.point.x, e.point.y); if (id) seleccionar(id, false); });
+map.on('click', e => { if (midiendo){ clicMedida(e); return; } if (ajustando && pc.activo){ puntoControl(e); return; } if (ajustando) return; const id = pick(e.point.x, e.point.y); if (id) seleccionar(id, false); });
 const tip = $('#tip'); let tPick = 0;
 map.on('mousemove', e => {
   if (performance.now() - tPick < 70 || map.getZoom() < D.zoom3d) { return; } tPick = performance.now();
@@ -4281,7 +4296,7 @@ let modoSen = lsGet('visor.senales') || (D.fuente_senales.tipo === 'http' ? 'htt
 let urlSen = lsGet('visor.url') || D.fuente_senales.url || ''; let vivos = {}, errorSen = null;
 $('#s-sen').value = modoSen; if (modoSen === 'http') setTimeout(() => leerServidor(), 0);
 function rnd(seed){ let h = 2166136261; for (const c of seed) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h ^= h >>> 13; return ((h >>> 0) % 10000) / 10000; }; }
-function pintarSenales(){
+function pintarSenales0(){
   const box = $('#sen'), tag = $('#sen-tag'); if (!box || !sel) return;
   const a = A[sel]; const pl = D.senales[a.tipo] || [];
   if (modoSen === 'historico' && H){ H.pintar(box, tag, a); return; }
@@ -4297,7 +4312,7 @@ function pintarSenales(){
     box.innerHTML = `<div style="color:var(--txt2)">Señales previstas: ${pl.map(x => esc(x[0])).join(', ') || '—'}.<br>Enlaza la fuente de datos con el ID <code>${esc(a.id)}</code>.</div>`;
   }
 }
-async function leerServidor(){ if (modoSen !== 'http' || !urlSen) return; try { const r = await fetch(urlSen, {cache: 'no-store'}); if (!r.ok) throw new Error('HTTP ' + r.status); vivos = await r.json(); errorSen = null; } catch(e){ errorSen = 'No se pudo leer el servidor (' + e.message + ').'; } pintarSenales(); }
+async function leerServidor(){ if (modoSen !== 'http' || !urlSen) return; try { const r = await fetch(urlSen, {cache: 'no-store'}); if (!r.ok) throw new Error('HTTP ' + r.status); vivos = await r.json(); errorSen = null; } catch(e){ errorSen = 'No se pudo leer el servidor (' + e.message + ').'; } pintarSenales(); if (modoColor === 'senal' && modoSen === 'http') aplicar(); }
 setInterval(() => { if (modoSen === 'demo') pintarSenales(); }, 2000);
 setInterval(leerServidor, (D.fuente_senales.intervalo_s || 5) * 1000);
 $('#s-sen').onchange = e => { modoSen = e.target.value; lsSet('visor.senales', modoSen); if (modoSen === 'http'){ const u = prompt('URL del servicio de datos (devuelve {"ID": {"señal": valor}})', urlSen); if (u !== null){ urlSen = u; lsSet('visor.url', u); } leerServidor(); } pintarSenales(); };
@@ -4945,6 +4960,277 @@ async function guardarMapa(){
   avisar(`Mapa guardado (${(html.length / 1e6).toFixed(1)} MB) con ${D.sitios.length} activo(s).`, 5000);
 }
 
+
+
+/* ---------- herramientas BIM: vistas, edificios, secciones, medir, ocultar/aislar, marcas y color por señal ---------- */
+function pintarSenales(){
+  pintarSenales0();
+  if ((modoSen !== 'http' && modoSen !== 'demo') || !sel) return;
+  const box = $('#sen'); if (!box) return;
+  box.querySelectorAll('.sg').forEach(r => {
+    const k = r.firstElementChild && r.firstElementChild.textContent; if (!k || r.querySelector('[data-colv]')) return;
+    r.lastElementChild.insertAdjacentHTML('beforeend', ` <button class="mini${modoColor === 'senal' && senalColor === k ? ' on' : ''}" data-colv="${esc(k)}" title="Colorear el modelo por esta señal">◐</button>`);
+  });
+  box.querySelectorAll('[data-colv]').forEach(b => b.onclick = () => colorearPor(b.dataset.colv));
+}
+setInterval(() => { if (modoColor === 'senal' && modoSen === 'demo') aplicar(); }, 2000);
+function valoresVivos(a){
+  if (modoSen === 'http') return vivos[a.id] || null;
+  if (modoSen === 'demo'){
+    const pl = D.senales[a.tipo] || []; if (!pl.length) return null;
+    const r = rnd(a.id + Math.floor(Date.now() / 2000)), o = {};
+    pl.forEach(([k, u, t, v, osc]) => { o[k] = t === 's' ? v : +(v + (r() - 0.5) * 2 * (osc || 0)).toFixed(osc && osc < 0.1 ? 2 : 1); });
+    return o;
+  }
+  return null;
+}
+function rangoVivo(nombre, tipo){
+  const k = nombre + '|' + (tipo || ''); if (memoVivo.has(k)) return memoVivo.get(k);
+  let lo = Infinity, hi = -Infinity;
+  for (const a of lista){ if (tipo && a.tipo !== tipo) continue; const v = (valoresVivos(a) || {})[nombre]; if (typeof v === 'number'){ if (v < lo) lo = v; if (v > hi) hi = v; } }
+  const r = [lo, hi]; memoVivo.set(k, r); return r;
+}
+function valorSenal(a){  // valor de la señal elegida en el instante que se ve (histórico) o ahora (vivo / DEMO)
+  if (modoSen === 'historico' && H){ const x = H.ser[a.id] && H.ser[a.id][senalColor]; return x ? valorEn(x, tH) : null; }
+  const vv = valoresVivos(a); return vv ? vv[senalColor] : null;
+}
+function colorSenal(a){
+  if (umbral != null){ const v = valorSenal(a); return typeof v === 'number' ? (v >= umbral ? '#d7191c' : '#2f9e6b') : '#cfd5db'; }
+  if (modoSen === 'historico' && H) return H.color(a);
+  const v = valorSenal(a); if (v == null) return '#cfd5db';
+  if (typeof v === 'number'){ const [lo, hi] = rangoVivo(senalColor, a.tipo); return rampa(hi > lo ? (v - lo) / (hi - lo) : 0.5); }
+  return COL_ESTADO[v] || '#8e6bd8';
+}
+function leyendaSenal(L){
+  const fuente = modoSen === 'historico' ? (H && H.simulado ? 'histórico SIMULADO' : 'histórico') : modoSen === 'demo' ? 'DEMO (valores simulados)' : modoSen === 'http' ? 'en vivo' : 'sin fuente de señales';
+  if (umbral != null){
+    L.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${esc(senalColor)} · ${esc(fuente)}</div><div><i style="background:#d7191c"></i>≥ ${umbral}</div><div><i style="background:#2f9e6b"></i>&lt; ${umbral}</div><div><i style="background:#cfd5db"></i>Sin dato</div>`;
+  } else if (modoSen === 'historico' && H){ H.leyenda(L); }
+  else {
+    const vals = lista.map(a => (valoresVivos(a) || {})[senalColor]).filter(v => v != null);
+    if (!vals.length) L.innerHTML = `<div style="font-weight:600">${esc(senalColor)}</div><div style="color:var(--txt2)">Sin datos ${esc(fuente)}.</div>`;
+    else if (typeof vals[0] === 'number'){
+      let [lo, hi] = rangoVivo(senalColor, tipoColor); if (!isFinite(lo)) [lo, hi] = rangoVivo(senalColor, null);
+      L.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${esc(senalColor)}${tipoColor ? ' · ' + esc(tipoColor) : ''} · ${esc(fuente)}</div><div style="color:var(--txt2);margin-bottom:3px">Cada tipo de equipo con su propia escala</div><div style="width:190px;height:10px;border-radius:3px;background:linear-gradient(90deg,${RAMPA.join(',')})"></div><div style="display:flex;justify-content:space-between;width:190px"><span>${esc(fmtV(lo))}</span><span>${esc(fmtV(hi))}</span></div>`;
+    } else L.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${esc(senalColor)} · ${esc(fuente)}</div>` + [...new Set(vals)].map(c => `<div><i style="background:${COL_ESTADO[c] || '#8e6bd8'}"></i>${esc(c)}</div>`).join('');
+  }
+  L.insertAdjacentHTML('beforeend', `<div style="margin-top:6px;display:flex;gap:4px;align-items:center;white-space:nowrap">Alarma si ≥ <input id="umb" type="number" step="any" value="${umbral ?? ''}" placeholder="valor" style="width:70px;padding:2px 4px" class="btn">${umbral != null ? ' <button class="mini" id="umb-x">quitar</button>' : ''}</div>`);
+  L.style.display = 'block';
+  L.querySelector('#umb').onchange = e => { const v = parseFloat(String(e.target.value).replace(',', '.')); umbral = isNaN(v) ? null : v; aplicar(); };
+  const x = L.querySelector('#umb-x'); if (x) x.onclick = () => { umbral = null; aplicar(); };
+}
+function leyendaMarcas(L){
+  const n = {}; Object.values(D.marcas).forEach(m => { const k = m.etiqueta || m.estado; n[k] = n[k] || {c: colorMarca(m), n: 0}; n[k].n++; });
+  L.innerHTML = `<div style="font-weight:600;margin-bottom:4px">Estado observado</div>` + (Object.keys(n).length ? Object.entries(n).map(([k, o]) => `<div><i style="background:${o.c}"></i>${esc(k)} (${o.n})</div>`).join('') : '<div style="color:var(--txt2)">Aún no hay marcas: selecciona un elemento y márcalo en su ficha.</div>') + '<div><i style="background:#d5dade"></i>Sin marcar</div>';
+  L.style.display = 'block';
+}
+
+/* --- sitio de trabajo y vistas --- */
+function sitioActual(){
+  const id = sel || (selGrupo && selGrupo.activos[0]);
+  if (id && A[id]) return D.sitios.find(s => s.codigo === A[id].sitio);
+  const c = map.getCenter(); let mejor = null, dm = Infinity;
+  for (const s of D.sitios){ const d = (s.lon - c.lng) ** 2 + (s.lat - c.lat) ** 2; if (d < dm){ dm = d; mejor = s; } }
+  return mejor;
+}
+function cajaSitio(s){
+  crearSitio(s); if (s.caja) return s.caja;
+  const b = new T.Box3();
+  for (const m of s.mallas) m.userData.inst.forEach((i, k) => { const a = A[i.a]; if (i.k === 'IfcSpace' || (a && a.tipo === 'Urbanización')) return; b.union(m.geometry.boundingBox.clone().applyMatrix4(m.userData.base[k])); });
+  return s.caja = b;
+}
+const aMerc = (s, x, y, z = 0) => new T.Vector3(x, y, z).applyMatrix4(s.modelo);
+function rumboY(s){ const c = s.centro_local, p0 = aMerc(s, c[0], c[1]), p1 = aMerc(s, c[0], c[1] + 10); return Math.atan2(p1.x - p0.x, -(p1.y - p0.y)) * 180 / Math.PI; }
+function encuadre(s, b, pitch, bearing){
+  const c = b.getCenter(new T.Vector3()), sz = b.getSize(new T.Vector3());
+  const r = pitch > 60 ? Math.max(30, Math.hypot(sz.x, sz.y), sz.z * 3) : Math.max(8, Math.hypot(sz.x, sz.y));
+  const p = aMerc(s, c.x, c.y, 0), ll = new maplibregl.MercatorCoordinate(p.x, p.y, 0).toLngLat();
+  const cv = map.getCanvas(), px = 0.75 * Math.min(cv.clientWidth, cv.clientHeight);
+  const z = Math.min(21.5, Math.max(D.zoom3d + 0.2, Math.log2(78271.517 * Math.cos(ll.lat * Math.PI / 180) * px / r)));
+  map.flyTo({center: ll, zoom: z, pitch, bearing, duration: 1300});
+}
+function vista(tipo, giro){
+  const s = sitioActual(); if (!s) return;
+  const ids = sel ? new Set([sel]) : selGrupo ? new Set(selGrupo.activos) : null;
+  const b = tipo === 'general' || !ids ? cajaSitio(s) : cajaLocal(s, ids);
+  const rb = rumboY(s);
+  if (tipo === 'general') encuadre(s, cajaSitio(s), 55, rb - 30);
+  else if (tipo === 'planta') encuadre(s, b, 0, rb);
+  else encuadre(s, b, map.getMaxPitch(), rb + giro);
+}
+
+/* --- secciones (planos de corte en coordenadas del modelo) --- */
+function planosCorte(){
+  if (!corte){ map.triggerRepaint(); return; }
+  if (corte.tipo === 'caja'){
+    const b = corte.caja.clone().expandByScalar(corte.val), m = b.min, M = b.max;
+    corte.planos = [new T.Plane(new T.Vector3(1, 0, 0), -m.x), new T.Plane(new T.Vector3(-1, 0, 0), M.x), new T.Plane(new T.Vector3(0, 1, 0), -m.y),
+                    new T.Plane(new T.Vector3(0, -1, 0), M.y), new T.Plane(new T.Vector3(0, 0, 1), -m.z), new T.Plane(new T.Vector3(0, 0, -1), M.z)];
+  } else {
+    const n = {x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1]}[corte.tipo], sg = corte.inv ? 1 : -1;  // por defecto se ve lo que queda por debajo / detrás del plano
+    corte.planos = [new T.Plane(new T.Vector3(n[0] * sg, n[1] * sg, n[2] * sg), -sg * corte.val)];
+  }
+  map.triggerRepaint();
+}
+function pintarPanelSeccion(){
+  const r = $('#sc-r'), v = $('#sc-v'), f = $('#sc-fil');
+  if (!corte){ f.style.display = 'none'; v.textContent = ''; $('#sc-txt').textContent = 'Elige un tipo de sección. Se aplica al activo seleccionado o al más cercano al centro del mapa.'; return; }
+  f.style.display = 'flex';
+  if (corte.tipo === 'caja'){ r.min = 0; r.max = 10; r.step = 0.1; r.value = corte.val; v.textContent = `margen ${corte.val.toFixed(1)} m`; $('#sc-inv').style.display = 'none'; }
+  else {
+    const b = cajaSitio(corte.s), ax = corte.tipo; r.min = b.min[ax].toFixed(2); r.max = b.max[ax].toFixed(2); r.step = 0.05; r.value = corte.val;
+    v.textContent = `${ax.toUpperCase()} = ${corte.val.toFixed(2)} m`; $('#sc-inv').style.display = '';
+  }
+  $('#sc-txt').textContent = `${corte.s.titulo}. ` + ({z: 'Corte horizontal: se ve lo que queda por debajo de la cota (⇄ para ver lo de encima).', x: 'Corte vertical según el eje X del modelo.', y: 'Corte vertical según el eje Y del modelo.', caja: 'Caja de sección alrededor de la selección (o del activo si no hay selección).'})[corte.tipo];
+}
+function ponerSeccion(tipo){
+  if (!tipo){ corte = null; planosCorte(); pintarPanelSeccion(); $('#b-sec').classList.remove('on'); return; }
+  const s = sitioActual(); if (!s){ avisar('Acércate a un activo para seccionarlo.', 3000); $('#sc-tipo').value = ''; return; }
+  const b = cajaSitio(s);
+  corte = {s, tipo, inv: false};
+  if (tipo === 'caja'){
+    const ids = sel ? new Set([sel]) : selGrupo ? new Set(selGrupo.activos) : null;
+    const cb = ids ? cajaLocal(s, ids) : null; corte.caja = cb && !cb.isEmpty() ? cb : b.clone(); corte.val = 0.5;
+  } else corte.val = tipo === 'z' ? Math.min(b.max.z, Math.max(b.min.z, 1.5)) : (b.min[tipo] + b.max[tipo]) / 2;
+  $('#b-sec').classList.add('on'); planosCorte(); pintarPanelSeccion();
+}
+
+/* --- medir --- */
+let midiendo = false, medPend = null; const medidas = [];
+const matMed = new T.MeshBasicMaterial({color: 0xd6247a, depthTest: false, transparent: true});
+const matLin = new T.LineBasicMaterial({color: 0xd6247a, depthTest: false, transparent: true});
+const geoBola = new T.SphereGeometry(1, 14, 10);
+function bola(s, p){ const o = new T.Mesh(geoBola, matMed); o.position.copy(p); o.renderOrder = 1001; o.userData.bola = true; s.grupo.add(o); return o; }
+function puntoEn(px, py){
+  const r = pickDet(px, py); if (r) return {s: r.sitio, p: r.p};
+  const s = sitioActual(); if (!s || !s.grupo.visible) return null;
+  const [o, f] = rayoLocal(matVista(s), px, py); const t = -o.z / (f.z - o.z); if (!(t > 0)) return null;
+  return {s, p: new T.Vector3(o.x + t * (f.x - o.x), o.y + t * (f.y - o.y), 0), suelo: true};
+}
+function clicMedida(e){
+  const q = puntoEn(e.point.x, e.point.y); if (!q){ avisar('Haz clic sobre el modelo o el terreno.', 2500); return; }
+  if (!medPend || medPend.s !== q.s){ if (medPend) medPend.s.grupo.remove(medPend.b); medPend = {s: q.s, p: q.p, b: bola(q.s, q.p)}; $('#md-txt').textContent = 'Ahora haz clic en el segundo punto.'; map.triggerRepaint(); return; }
+  const g = new T.BufferGeometry().setFromPoints([medPend.p, q.p]); const lin = new T.Line(g, matLin); lin.renderOrder = 1000; q.s.grupo.add(lin);
+  const et = document.createElement('div'); et.className = 'flot medet'; $('#mapa').appendChild(et);
+  const p1 = medPend.p, p2 = q.p, d = p1.distanceTo(p2), dh = Math.hypot(p2.x - p1.x, p2.y - p1.y), dz = p2.z - p1.z;
+  et.textContent = d.toFixed(2).replace('.', ',') + ' m';
+  medidas.push({s: q.s, p1, p2, d, dh, dz, objs: [medPend.b, bola(q.s, p2), lin], et});
+  medPend = null; pintarMedidas(); map.triggerRepaint();
+}
+const f2 = v => v.toFixed(2).replace('.', ',');
+function pintarMedidas(){
+  $('#md-lista').innerHTML = medidas.map((m, k) => `<div class="fil" style="justify-content:space-between"><span><b>${k + 1}.</b> ${f2(m.d)} m</span><span style="color:var(--txt2)">horiz. ${f2(m.dh)} · ΔZ ${m.dz >= 0 ? '+' : ''}${f2(m.dz)}</span></div>`).join('');
+  $('#md-txt').textContent = midiendo ? 'Haz clic en dos puntos del modelo (o del terreno).' : 'Pulsa «Medir» para medir distancias.';
+}
+function borrarMedidas(){
+  medidas.forEach(m => { m.objs.forEach(o => m.s.grupo.remove(o)); m.et.remove(); }); medidas.length = 0;
+  if (medPend){ medPend.s.grupo.remove(medPend.b); medPend = null; }
+  pintarMedidas(); map.triggerRepaint();
+}
+map.on('render', () => {
+  if (!ultimaMatriz || (!medidas.length && !medPend)) return;
+  const cv = map.getCanvas(), W = cv.clientWidth, Hh = cv.clientHeight;
+  const mpp = 78271.517 * Math.cos(map.getCenter().lat * Math.PI / 180) / 2 ** map.getZoom();
+  const esc5 = Math.max(0.03, 5 * mpp);
+  for (const m of [...medidas, ...(medPend ? [{s: medPend.s, objs: [medPend.b]}] : [])]){
+    m.objs.forEach(o => { if (o.userData.bola) o.scale.setScalar(esc5); });
+    if (!m.et) continue;
+    const c = m.p1.clone().add(m.p2).multiplyScalar(0.5), v = new T.Vector4(c.x, c.y, c.z, 1).applyMatrix4(matVista(m.s));
+    const ok = m.s.grupo.visible && v.w > 0; m.et.style.display = ok ? '' : 'none'; if (!ok) continue;
+    m.et.style.left = ((v.x / v.w + 1) / 2 * W + 8) + 'px'; m.et.style.top = ((1 - v.y / v.w) / 2 * Hh - 10) + 'px';
+  }
+});
+
+/* --- ocultar / aislar --- */
+const idsSeleccion = () => sel ? [sel] : selGrupo ? selGrupo.activos.slice() : [];
+function estadoVis(){
+  const n = ocultosId.size, na = aislados.size;
+  $('#b-tod').textContent = n || na ? `Mostrar todo (${na ? 'aislados ' + na : n + ' ocultos'})` : 'Mostrar todo';
+  filas.forEach((r, id) => r.style.opacity = visibleId(id) ? '' : '0.45');
+  aplicar();
+}
+function ocultarSel(){ const ids = idsSeleccion(); if (!ids.length){ avisar('Selecciona antes un elemento o un grupo.', 2500); return; } ids.forEach(i => { ocultosId.add(i); aislados.delete(i); }); sel = null; selGrupo = null; resaltar(); estadoVis(); }
+function aislarSel(){ const ids = idsSeleccion(); if (!ids.length){ avisar('Selecciona antes un elemento o un grupo.', 2500); return; } aislados.clear(); ids.forEach(i => { aislados.add(i); ocultosId.delete(i); }); estadoVis(); }
+function mostrarTodo(){ ocultosId.clear(); aislados.clear(); estadoVis(); }
+
+/* --- marcas de estado (se guardan con «Guardar mapa») --- */
+Object.entries(D.marcas).forEach(([id, m]) => { if (A[id]) A[id].marca = m.etiqueta || m.estado; });
+cols.push(['marca', 'Marca']);
+function seccionMarca(ids){
+  ids = ids.filter(x => A[x] && A[x].clase !== 'IfcCableSegment'); const f = der.querySelector('.ficha'); if (!f || !ids.length) return;
+  const ms = ids.map(x => D.marcas[x]), m0 = ms[0], todas = ms.every(m => m && m0 && (m.etiqueta || m.estado) === (m0.etiqueta || m0.estado));
+  const nm = ms.filter(Boolean).length;
+  const div = document.createElement('div'); div.className = 'sec'; div.id = 'sec-marca';
+  div.innerHTML = `<div class="st">Estado observado${ids.length > 1 ? ` · ${ids.length} elementos` : ''}</div>
+    <div class="marcas">${MARCAS.map(([k, t, c]) => `<button class="btn mk${todas && m0.estado === k ? ' on' : ''}" data-mk="${k}"><i style="background:${c}"></i>${t}</button>`).join('')}
+    <label class="btn mk" title="Marca con un color propio"><input type="color" id="mk-col" value="${m0 && m0.color ? m0.color : '#8e6bd8'}">Otro</label></div>
+    <input class="btn" id="mk-nota" style="width:100%;margin-top:6px" placeholder="Nota (opcional): p. ej. fuga de aceite, punto caliente…" value="${esc(todas && m0 ? m0.nota || '' : '')}">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;color:var(--txt2);font-size:11.5px"><span>${nm ? (todas && m0 ? `${esc(m0.etiqueta)} · ${esc(m0.fecha)}` : `${nm} de ${ids.length} marcados`) : 'Sin marcar'}</span>${nm ? '<button class="mini" id="mk-quitar">quitar marca</button>' : ''}</div>`;
+  const ref = f.querySelector('.sec'); ref ? f.insertBefore(div, ref) : f.appendChild(div);
+  const poner = (estado, etiqueta, color) => {
+    const nota = $('#mk-nota').value.trim(), fecha = new Date().toLocaleString('es-ES', {day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'});
+    ids.forEach(x => { D.marcas[x] = {estado, etiqueta, color: color || null, nota, fecha}; A[x].marca = etiqueta; });
+    modoColor = 'marcas'; $('#s-color').value = 'marcas'; aplicar(); refrescarFicha();
+    avisar(`${ids.length > 1 ? ids.length + ' elementos marcados' : 'Marcado'} como <b>${esc(etiqueta)}</b>. Usa «Guardar mapa» para conservarlo.`, 5000);
+  };
+  div.querySelectorAll('[data-mk]').forEach(b => b.onclick = () => { const x = MARCAS.find(y => y[0] === b.dataset.mk); poner(x[0], x[1], null); });
+  div.querySelector('#mk-col').onchange = e => poner('otro', $('#mk-nota').value.trim() || 'Marca', e.target.value);
+  $('#mk-nota').onchange = () => { if (nm && todas){ ids.forEach(x => D.marcas[x].nota = $('#mk-nota').value.trim()); } };
+  const q = div.querySelector('#mk-quitar'); if (q) q.onclick = () => { ids.forEach(x => { delete D.marcas[x]; delete A[x].marca; }); aplicar(); refrescarFicha(); };
+}
+function refrescarFicha(){ if (sel) fichaActivo(A[sel]); else if (selGrupo) fichaGrupo(selGrupo); }
+const fichaActivoBase = fichaActivo, fichaGrupoBase = fichaGrupo;
+fichaActivo = a => { fichaActivoBase(a); seccionMarca([a.id]); verBim(); };
+fichaGrupo = g => { fichaGrupoBase(g); seccionMarca(g.activos); verBim(); };
+$('#s-color').insertAdjacentHTML('beforeend', '<option value="marcas">Color: marcas de estado</option>');
+
+/* --- barra de herramientas y paneles --- */
+const estBIM = document.createElement('style');
+estBIM.textContent = `#bim{left:10px;top:118px;padding:6px;display:flex;flex-direction:column;gap:4px;width:158px}#bim .btn{text-align:left;font-size:12px;padding:4px 8px}
+#bim .btn.on,.mk.on{border-color:var(--acc);color:var(--acc);font-weight:600}#bim hr{border:0;border-top:1px solid var(--line);margin:2px 0}
+.pbim{left:176px;top:118px;padding:10px 12px;width:270px;display:none}.pbim .fil{display:flex;gap:6px;align-items:center;margin:4px 0}
+.medet{padding:1px 6px;font-weight:600;pointer-events:none;color:#d6247a;white-space:nowrap}
+.marcas{display:flex;flex-wrap:wrap;gap:4px}.mk{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 7px}.mk i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.mk input[type=color]{width:16px;height:14px;border:0;padding:0;background:none}
+.mini{border:1px solid var(--line);background:var(--panel2);border-radius:5px;cursor:pointer;padding:0 5px;font-size:11px;margin-left:4px;color:var(--txt2)}.mini.on,.mini:hover{border-color:var(--acc);color:var(--acc)}`;
+document.head.appendChild(estBIM);
+const bim = document.createElement('div'); bim.className = 'flot'; bim.id = 'bim';
+bim.innerHTML = `<button class="btn" id="v-gen" title="Encuadrar el activo completo en 3D">Vista general</button>
+<button class="btn" id="v-plan" title="Vista desde arriba alineada con los planos (de la selección, o del activo)">Planta</button>
+<select class="btn" id="v-alz" title="Alzados del activo o de la selección"><option value="">Alzado…</option><option value="0">Alzado sur</option><option value="180">Alzado norte</option><option value="-90">Alzado este</option><option value="90">Alzado oeste</option></select>
+<select class="btn" id="s-edif" title="Cómo se ven los edificios"><option value="trans">Edificios: transparentes</option><option value="opacos">Edificios: opacos</option><option value="ocultos">Edificios: ocultos</option></select><hr>
+<button class="btn" id="b-sec" title="Planos de sección y caja de sección">Sección</button>
+<button class="btn" id="b-med" title="Medir distancias entre dos puntos">Medir</button><hr>
+<button class="btn" id="b-ocu" title="Ocultar el elemento o grupo seleccionado">Ocultar selección</button>
+<button class="btn" id="b-ais" title="Ver solo el elemento o grupo seleccionado">Aislar selección</button>
+<button class="btn" id="b-tod" title="Volver a mostrar todo">Mostrar todo</button>`;
+$('#mapa').appendChild(bim);
+const pSec = document.createElement('div'); pSec.className = 'flot pbim'; pSec.id = 'p-sec';
+pSec.innerHTML = `<div class="st">Sección</div><select class="btn" id="sc-tipo" style="width:100%"><option value="">Sin sección</option><option value="z">Horizontal (a una cota)</option><option value="x">Vertical · eje X del modelo</option><option value="y">Vertical · eje Y del modelo</option><option value="caja">Caja de sección (selección)</option></select>
+<div class="fil" id="sc-fil" style="display:none"><input type="range" id="sc-r" style="flex:1"><button class="btn" id="sc-inv" title="Ver el otro lado del corte">⇄</button></div><div id="sc-v" style="font-weight:600"></div>
+<div id="sc-txt" style="color:var(--txt2);font-size:11.5px;margin-top:4px"></div><div class="fil" style="justify-content:flex-end"><button class="btn" id="sc-cerrar">Cerrar</button></div>`;
+const pMed = document.createElement('div'); pMed.className = 'flot pbim'; pMed.id = 'p-med';
+pMed.innerHTML = `<div class="st">Medir</div><div id="md-txt" style="color:var(--txt2);font-size:11.5px"></div><div id="md-lista" style="margin-top:6px"></div>
+<div class="fil" style="justify-content:flex-end"><button class="btn" id="md-borrar">Borrar medidas</button><button class="btn" id="md-cerrar">Terminar</button></div>`;
+$('#mapa').appendChild(pSec); $('#mapa').appendChild(pMed);
+$('#v-gen').onclick = () => vista('general');
+$('#v-plan').onclick = () => vista('planta');
+$('#v-alz').onchange = e => { if (e.target.value !== '') vista('alzado', +e.target.value); e.target.value = ''; };
+$('#s-edif').onchange = e => { modoEdif = e.target.value; aplicar(); };
+$('#b-sec').onclick = () => { const on = pSec.style.display !== 'block'; pSec.style.display = on ? 'block' : 'none'; pMed.style.display = 'none'; if (on) pintarPanelSeccion(); };
+$('#sc-tipo').onchange = e => ponerSeccion(e.target.value);
+$('#sc-r').oninput = e => { if (!corte) return; corte.val = +e.target.value; planosCorte(); pintarPanelSeccion(); };
+$('#sc-inv').onclick = () => { if (!corte) return; corte.inv = !corte.inv; planosCorte(); };
+$('#sc-cerrar').onclick = () => { pSec.style.display = 'none'; };
+const ponerMedir = on => { midiendo = on; $('#b-med').classList.toggle('on', on); pMed.style.display = on || medidas.length ? 'block' : 'none'; if (on) pSec.style.display = 'none'; map.getCanvas().style.cursor = on ? 'crosshair' : ''; if (!on && medPend){ medPend.s.grupo.remove(medPend.b); medPend = null; map.triggerRepaint(); } pintarMedidas(); };
+$('#b-med').onclick = () => ponerMedir(!midiendo);
+$('#md-cerrar').onclick = () => { ponerMedir(false); pMed.style.display = 'none'; };
+$('#md-borrar').onclick = borrarMedidas;
+$('#b-ocu').onclick = ocultarSel; $('#b-ais').onclick = aislarSel; $('#b-tod').onclick = mostrarTodo;
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && midiendo) ponerMedir(false); });
+const verBim = () => { bim.style.display = map.getZoom() >= D.zoom3d - 1.5 || sel || selGrupo ? 'flex' : 'none'; if (bim.style.display === 'none'){ pSec.style.display = 'none'; } };
+map.on('zoom', verBim); verBim();
+window.__bim = {vista, ponerSeccion, sitioActual, cajaSitio, ocultarSel, aislarSel, mostrarTodo, clicMedida, ponerMedir, get corte(){ return corte; }, medidas};
 
 construirArbol(); leyenda();
 window.__mapa = {map, seleccionar, irASitio, D, A, registrarSitio};
